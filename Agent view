@@ -1,0 +1,1222 @@
+/*******************************************************
+ * QUALITY AUDIT DASHBOARD
+ * CONSOLIDATED Code.gs
+ *
+ * Required sheets:
+ *   1. Raw_dump
+ *   2. Users
+ *
+ * Users headers:
+ *   Email ID | Name | Role
+ *
+ * Optional:
+ *   Audit_Log
+ *
+ * Features:
+ *   - Role based access
+ *   - Agent sees only own audits
+ *   - Dashboard summary and filters
+ *   - Agent can accept feedback once
+ *   - Agent can raise ONE permanent dispute per Audit ID
+ *   - Dispute/feedback data is stored in Raw_dump
+ *   - Server-side identity validation
+ *   - Script lock prevents duplicate submissions
+ *******************************************************/
+
+const CONFIG = {
+  SPREADSHEET_ID: '1T3cWdUnPcXo3BrfGkJuqIwPmqsVKNkX46Nmp0flnsks',
+  RAW_SHEET: 'Raw_dump1',
+  USERS_SHEET: 'Users',
+  AUDIT_LOG_SHEET: 'Audit_Log',
+  MAX_RECORDS: 100000
+};
+
+const RAW_DUMP1_ACTION_HEADERS = [
+  'Dispute ID',
+  'Dispute Raised At',
+  'Dispute Raised By',
+  'Dispute Raised By Email',
+  'Dispute status',
+  'Dispute Remarks',
+  'Feedback Status',
+  'Feedback Accepted At',
+  'Feedback Accepted By',
+  'Feedback Accepted By Email'
+];
+
+/* =====================================================
+   WEB APP
+   ===================================================== */
+
+function doGet() {
+  return HtmlService
+    .createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('Quality Audit Dashboard')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/* =====================================================
+   DASHBOARD
+   ===================================================== */
+
+function getDashboardData() {
+  try {
+    const user = getCurrentUser_();
+    if (!user.success) return user;
+
+    const data = getAuditDataForUser_(user);
+    const summary = calculateSummary_(data);
+    const filters = getAvailableFilters_(data);
+
+    return {
+      success: true,
+      user: {
+        email: user.email,
+        name: user.name,
+        role: user.role
+      },
+      data: data,
+      summary: summary,
+      filters: filters
+    };
+  } catch (error) {
+    console.error('getDashboardData:', error);
+    return {
+      success: false,
+      message: error && error.message ? error.message : 'Unable to load dashboard data.'
+    };
+  }
+}
+
+/* =====================================================
+   CURRENT USER
+   ===================================================== */
+
+function getCurrentUser_() {
+  try {
+    const email = getCurrentUserEmail_();
+
+    if (!email) {
+      return {
+        success: false,
+        message: 'Unable to identify your Google account. Please make sure the web app is deployed correctly.'
+      };
+    }
+
+    const sheet = getSheet_(CONFIG.USERS_SHEET);
+    const values = sheet.getDataRange().getValues();
+
+    if (values.length < 2) {
+      return {
+        success: false,
+        message: 'Users sheet does not contain any users.'
+      };
+    }
+
+    const headers = values[0].map(normalizeHeader_);
+    const emailIndex = headers.indexOf('email id');
+    const nameIndex = headers.indexOf('name');
+    const roleIndex = headers.indexOf('role');
+
+    if (emailIndex === -1 || nameIndex === -1 || roleIndex === -1) {
+      return {
+        success: false,
+        message: 'Users sheet must contain these headers: Email ID, Name, Role'
+      };
+    }
+
+    for (let r = 1; r < values.length; r++) {
+      const rowEmail = normalizeEmail_(values[r][emailIndex]);
+
+      if (rowEmail === email) {
+        const name = String(values[r][nameIndex] || '').trim();
+        const role = normalizeRole_(values[r][roleIndex]);
+
+        if (!['ADMIN', 'SUPERVISOR', 'AGENT'].includes(role)) {
+          return {
+            success: false,
+            message: 'Invalid role assigned to your account. Allowed roles are Admin, Supervisor or Agent.'
+          };
+        }
+
+        return {
+          success: true,
+          email: email,
+          name: name,
+          role: role
+        };
+      }
+    }
+
+    return {
+      success: false,
+      message: 'Your email address (' + email + ') is not present in the Users sheet.'
+    };
+  } catch (error) {
+    console.error('getCurrentUser_:', error);
+    return {
+      success: false,
+      message: 'Unable to identify the current user: ' + (error.message || error)
+    };
+  }
+}
+
+function getCurrentUserEmail_() {
+  try {
+    return Session.getActiveUser().getEmail().toString().trim().toLowerCase();
+  } catch (error) {
+    console.error('getCurrentUserEmail_:', error);
+    return '';
+  }
+}
+
+/* =====================================================
+   AUDIT DATA
+   ===================================================== */
+
+function getAuditDataForUser_(user) {
+  const sheet = getSheet_(CONFIG.RAW_SHEET);
+  ensureRawDumpActionColumns_();
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  const rawHeaders = values[0];
+  const normalizedHeaders = rawHeaders.map(normalizeHeader_);
+
+  const agentEmailIndex = normalizedHeaders.indexOf('agent email id');
+
+  if (agentEmailIndex === -1) {
+    throw new Error('Raw_dump does not contain the "Agent email ID" column.');
+  }
+
+  /*
+   * Call Date is normally column G.
+   * We identify it by header rather than hard-coding column number.
+   */
+  let callDateIndex = normalizedHeaders.indexOf('call date');
+
+  /*
+   * Fallback in case the header has a small variation.
+   */
+  if (callDateIndex === -1) {
+    callDateIndex = normalizedHeaders.indexOf('calldate');
+  }
+
+  const records = [];
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+
+    if (isBlankRow_(row)) continue;
+
+    /*
+     * Agent sees only their own audits.
+     */
+    if (user.role === 'AGENT') {
+      const rowAgentEmail = normalizeEmail_(row[agentEmailIndex]);
+
+      if (rowAgentEmail !== user.email) {
+        continue;
+      }
+    }
+
+    const record = {};
+
+    for (let c = 0; c < rawHeaders.length; c++) {
+      const key = String(rawHeaders[c] || '').trim();
+
+      if (!key) continue;
+
+      record[key] = formatCellValue_(row[c]);
+    }
+
+    /*
+     * Canonical values used by the frontend.
+     */
+    record.__auditId = getAuditId_(record);
+
+    record.__agentName =
+      firstNonBlank_([
+        record['Agent name'],
+        record['Agent Name']
+      ]);
+
+    record.__agentEmail =
+      firstNonBlank_([
+        record['Agent email ID'],
+        record['Agent Email ID']
+      ]);
+
+    record.__auditDate =
+      firstNonBlank_([
+        record['Audit date'],
+        record['Audit Date']
+      ]);
+
+    /*
+     * IMPORTANT:
+     * Call Date is the date used by the From Date / To Date filter.
+     */
+    let callDateValue = '';
+
+    if (callDateIndex !== -1) {
+      callDateValue = row[callDateIndex];
+    }
+
+    record.__callDate = normalizeDateForFilter_(callDateValue);
+
+    record.__ticketId =
+      firstNonBlank_([
+        record['RMN/CMN/Ticket ID'],
+        record['Ticket / RMN / CMN']
+      ]);
+
+    record.__score =
+      firstNonBlank_([
+        record['% Score'],
+        record['Score']
+      ]);
+
+    record.__callStatus =
+      firstNonBlank_([
+        record['Call status'],
+        record['Call Status']
+      ]);
+
+    records.push(record);
+
+    if (records.length >= CONFIG.MAX_RECORDS) {
+      break;
+    }
+  }
+
+  return records;
+}
+
+/* =====================================================
+   SUMMARY
+   ===================================================== */
+
+function calculateSummary_(records) {
+  const summary = {
+    totalAudits: records.length,
+    averageScore: 0,
+    fatalErrors: 0,
+    uniqueAgents: 0,
+    uniqueAuditors: 0,
+    uniqueLOBs: 0,
+    auditTypes: {},
+    callStatuses: {},
+    scores: [],
+    weeklyData: {},
+    monthlyData: {},
+    agentPerformance: {},
+    attributeErrors: {}
+  };
+
+  if (!records.length) return summary;
+
+  const agents = {};
+  const auditors = {};
+  const lobs = {};
+  let scoreTotal = 0;
+  let scoreCount = 0;
+
+  records.forEach(function(record) {
+    const score = parseScore_(firstNonBlank_([record['% Score'], record['Score']]));
+    const agent = String(firstNonBlank_([record['Agent name'], record['Agent Name']]) || '').trim();
+    const auditor = String(record['Auditor Name'] || '').trim();
+    const lob = String(record['LOB'] || '').trim();
+    const auditType = String(record['Audit Type'] || '').trim();
+    const callStatus = String(firstNonBlank_([record['Call status'], record['Call Status']]) || '').trim();
+    const week = String(record['Week'] || '').trim();
+    const month = String(record['Month'] || '').trim();
+
+    if (score !== null) {
+      scoreTotal += score;
+      scoreCount++;
+      summary.scores.push(score);
+    }
+
+    if (agent) agents[agent] = true;
+    if (auditor) auditors[auditor] = true;
+    if (lob) lobs[lob] = true;
+
+    incrementObject_(summary.auditTypes, auditType);
+    incrementObject_(summary.callStatuses, callStatus);
+
+    if (week) {
+      if (!summary.weeklyData[week]) {
+        summary.weeklyData[week] = { audits: 0, scoreTotal: 0, scoreCount: 0 };
+      }
+      summary.weeklyData[week].audits++;
+      if (score !== null) {
+        summary.weeklyData[week].scoreTotal += score;
+        summary.weeklyData[week].scoreCount++;
+      }
+    }
+
+    if (month) {
+      if (!summary.monthlyData[month]) {
+        summary.monthlyData[month] = { audits: 0, scoreTotal: 0, scoreCount: 0 };
+      }
+      summary.monthlyData[month].audits++;
+      if (score !== null) {
+        summary.monthlyData[month].scoreTotal += score;
+        summary.monthlyData[month].scoreCount++;
+      }
+    }
+
+    if (agent) {
+      if (!summary.agentPerformance[agent]) {
+        summary.agentPerformance[agent] = {
+          audits: 0,
+          scoreTotal: 0,
+          scoreCount: 0,
+          fatalErrors: 0
+        };
+      }
+
+      summary.agentPerformance[agent].audits++;
+      if (score !== null) {
+        summary.agentPerformance[agent].scoreTotal += score;
+        summary.agentPerformance[agent].scoreCount++;
+      }
+
+      if (callStatus.toLowerCase() === 'fatal') {
+        summary.agentPerformance[agent].fatalErrors++;
+        summary.fatalErrors++;
+      }
+    }
+
+    collectAttributeErrors_(record, summary.attributeErrors);
+  });
+
+  summary.uniqueAgents = Object.keys(agents).length;
+  summary.uniqueAuditors = Object.keys(auditors).length;
+  summary.uniqueLOBs = Object.keys(lobs).length;
+  summary.averageScore = scoreCount ? roundNumber_(scoreTotal / scoreCount, 2) : 0;
+
+  Object.keys(summary.weeklyData).forEach(function(key) {
+    const item = summary.weeklyData[key];
+    item.averageScore = item.scoreCount ? roundNumber_(item.scoreTotal / item.scoreCount, 2) : 0;
+    delete item.scoreTotal;
+    delete item.scoreCount;
+  });
+
+  Object.keys(summary.monthlyData).forEach(function(key) {
+    const item = summary.monthlyData[key];
+    item.averageScore = item.scoreCount ? roundNumber_(item.scoreTotal / item.scoreCount, 2) : 0;
+    delete item.scoreTotal;
+    delete item.scoreCount;
+  });
+
+  Object.keys(summary.agentPerformance).forEach(function(key) {
+    const item = summary.agentPerformance[key];
+    item.averageScore = item.scoreCount ? roundNumber_(item.scoreTotal / item.scoreCount, 2) : 0;
+    delete item.scoreTotal;
+    delete item.scoreCount;
+  });
+
+  return summary;
+}
+
+function incrementObject_(object, key) {
+  if (!key) return;
+  object[key] = (object[key] || 0) + 1;
+}
+
+function collectAttributeErrors_(record, result) {
+  const excluded = {
+    'audit_id': true, 'audit id': true, 'timestamp': true,
+    'auditor name': true, 'lob': true, 'agent name': true,
+    'agent email id': true, 'audit type': true, 'call date': true,
+    'audit date': true, 'rmn/cmn/ticket id': true, 'call link': true,
+    'call duration': true, 'voa / voc': true, '% score': true,
+    'areas of improvement': true, 'acppt': true, 'acppt remarks': true,
+    'attribute': true, 'disposition': true, 'aht remarks': true,
+    'call status': true, 'feedback': true, 'agent remarks': true,
+    'dispute status': true, 'dispute remarks': true, 'dispute id': true,
+    'dispute raised at': true, 'dispute raised by': true,
+    'dispute raised by email': true, 'feedback status': true,
+    'feedback accepted': true, 'feedback accepted at': true,
+    'feedback accepted by': true, 'feedback accepted by email': true,
+    'week': true, 'month': true
+  };
+
+  Object.keys(record).forEach(function(key) {
+    if (key.indexOf('__') === 0) return;
+
+    const normalized = normalizeHeader_(key);
+    if (excluded[normalized]) return;
+
+    if (String(record[key] || '').trim().toLowerCase() === 'error') {
+      result[key] = (result[key] || 0) + 1;
+    }
+  });
+}
+
+function getAvailableFilters_(records) {
+
+  const filters = {
+    agents: [],
+    auditors: [],
+    lobs: [],
+    auditTypes: [],
+    weeks: [],
+    months: [],
+    callStatuses: [],
+    callDates: []
+  };
+
+  const sets = {
+    agents: {},
+    auditors: {},
+    lobs: {},
+    auditTypes: {},
+    weeks: {},
+    months: {},
+    callStatuses: {},
+    callDates: {}
+  };
+
+  records.forEach(function(record) {
+
+    addUniqueValue_(
+      sets.agents,
+      firstNonBlank_([
+        record['Agent name'],
+        record['Agent Name']
+      ])
+    );
+
+    addUniqueValue_(
+      sets.auditors,
+      record['Auditor Name']
+    );
+
+    addUniqueValue_(
+      sets.lobs,
+      record['LOB']
+    );
+
+    addUniqueValue_(
+      sets.auditTypes,
+      record['Audit Type']
+    );
+
+    addUniqueValue_(
+      sets.weeks,
+      record['Week']
+    );
+
+    addUniqueValue_(
+      sets.months,
+      record['Month']
+    );
+
+    addUniqueValue_(
+      sets.callStatuses,
+      firstNonBlank_([
+        record['Call status'],
+        record['Call Status']
+      ])
+    );
+
+    /*
+     * Call Date used for From Date / To Date.
+     *
+     * Example:
+     * 3/16/2026
+     *
+     * becomes:
+     * 2026-03-16
+     */
+    addUniqueValue_(
+      sets.callDates,
+      record.__callDate
+    );
+
+  });
+
+  /*
+   * Normal filters.
+   */
+  filters.agents =
+    Object.keys(sets.agents).sort();
+
+  filters.auditors =
+    Object.keys(sets.auditors).sort();
+
+  filters.lobs =
+    Object.keys(sets.lobs).sort();
+
+  filters.auditTypes =
+    Object.keys(sets.auditTypes).sort();
+
+  filters.weeks =
+    Object.keys(sets.weeks).sort();
+
+  filters.months =
+    Object.keys(sets.months).sort();
+
+  filters.callStatuses =
+    Object.keys(sets.callStatuses).sort();
+
+  /*
+   * IMPORTANT:
+   * Dates must be sorted chronologically,
+   * NOT alphabetically.
+   */
+  filters.callDates =
+    Object.keys(sets.callDates).sort();
+
+  return filters;
+}
+
+/* =====================================================
+   SHEET / OBJECT HELPERS
+   ===================================================== */
+
+function getSpreadsheet_() {
+  return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+}
+
+function getSheet_(sheetName) {
+  const sheet = getSpreadsheet_().getSheetByName(sheetName);
+  if (!sheet) throw new Error('Sheet "' + sheetName + '" was not found in the configured spreadsheet.');
+  return sheet;
+}
+
+function getSheetObjects_(sheet) {
+  if (!sheet) return [];
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  const headers = values[0];
+  const objects = [];
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (isBlankRow_(row)) continue;
+
+    const object = {};
+    headers.forEach(function(header, c) {
+      object[String(header || '').trim()] = row[c];
+    });
+    object._rowNumber = r + 1;
+    objects.push(object);
+  }
+
+  return objects;
+}
+
+function updateObjectRow_(sheet, rowNumber, updates) {
+  if (!sheet || !rowNumber || rowNumber < 2) throw new Error('Invalid sheet row number.');
+
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+
+  Object.keys(updates).forEach(function(header) {
+    const index = headers.indexOf(header);
+    if (index === -1) throw new Error('Column "' + header + '" was not found in the sheet.');
+    sheet.getRange(rowNumber, index + 1).setValue(updates[header]);
+  });
+}
+
+function appendObjectRow_(sheet, data) {
+  if (!sheet) return;
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return;
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  sheet.appendRow(headers.map(function(header) {
+    return Object.prototype.hasOwnProperty.call(data, header) ? data[header] : '';
+  }));
+}
+
+function ensureRawDumpActionColumns_() {
+  const sheet = getSheet_(CONFIG.RAW_SHEET);
+  let lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) throw new Error('Raw_dump does not contain a header row.');
+
+  let headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+
+  RAW_DUMP1_ACTION_HEADERS.forEach(function(header) {
+    if (headers.indexOf(header) === -1) {
+      lastColumn++;
+      sheet.getRange(1, lastColumn).setValue(header);
+      headers.push(header);
+    }
+  });
+
+  return { sheet: sheet, headers: headers };
+}
+
+/* =====================================================
+   AUDIT ID / DISPUTE HELPERS
+   ===================================================== */
+
+function getAuditId_(audit) {
+  if (!audit) return '';
+  return String(firstNonBlank_([
+    audit['Audit_ID'],
+    audit['Audit ID'],
+    audit['auditId']
+  ]) || '').trim();
+}
+
+function normalizeAuditId_(value) {
+  return String(value == null ? '' : value).trim().toLowerCase();
+}
+
+function findRawDumpAudit_(auditId) {
+  const result = ensureRawDumpActionColumns_();
+  const normalized = normalizeAuditId_(auditId);
+  if (!normalized) return null;
+
+  const rows = getSheetObjects_(result.sheet);
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowId = normalizeAuditId_(getAuditId_(rows[i]));
+    if (rowId && rowId === normalized) return rows[i];
+  }
+
+  return null;
+}
+
+function getRawDumpDisputeState_(row) {
+  if (!row) {
+    return { exists: false, disputeId: '', status: '', remarks: '' };
+  }
+
+  const disputeId = String(row['Dispute ID'] || '').trim();
+  const status = String(row['Dispute status'] || row['Dispute Status'] || '').trim();
+  const remarks = String(row['Dispute Remarks'] || '').trim();
+
+  return {
+    /* ANY historical dispute data permanently blocks another dispute. */
+    exists: !!disputeId || !!status || !!remarks,
+    disputeId: disputeId,
+    status: status,
+    remarks: remarks
+  };
+}
+
+function hasPermanentDispute_(auditId) {
+  const row = findRawDumpAudit_(auditId);
+  if (!row) return false;
+  return getRawDumpDisputeState_(row).exists;
+}
+
+function getExistingDispute_(auditId) {
+  const row = findRawDumpAudit_(auditId);
+  if (!row) return null;
+
+  const state = getRawDumpDisputeState_(row);
+  if (!state.exists) return null;
+
+  return { row: row, state: state };
+}
+
+/* =====================================================
+   RAISE DISPUTE
+   ===================================================== */
+
+function raiseDispute(disputeData) {
+  const lock = LockService.getScriptLock();
+
+  try {
+    lock.waitLock(30000);
+
+    if (!disputeData || typeof disputeData !== 'object') {
+      return { success: false, error: 'Invalid dispute request.' };
+    }
+
+    const auditId = String(disputeData.auditId || '').trim();
+    const remarks = String(disputeData.remarks || '').trim();
+
+    if (!auditId) return { success: false, error: 'Audit ID is required.' };
+    if (!remarks) return { success: false, error: 'Please enter dispute remarks.' };
+
+    const currentEmail = getCurrentUserEmail_();
+    if (!currentEmail) {
+      return { success: false, error: 'Unable to identify your Google account.' };
+    }
+
+    const rawDump = ensureRawDumpActionColumns_();
+    const sheet = rawDump.sheet;
+    const auditRow = findRawDumpAudit_(auditId);
+
+    if (!auditRow) {
+      return { success: false, error: 'Audit record was not found in Raw_dump.' };
+    }
+
+    const auditAgentEmail = normalizeEmail_(auditRow['Agent email ID']);
+
+    if (auditAgentEmail && auditAgentEmail !== currentEmail) {
+      return {
+        success: false,
+        error: 'You are not authorized to raise a dispute for this audit.'
+      };
+    }
+
+    /* Permanent server-side check. It is performed while the script lock is held. */
+    if (hasPermanentDispute_(auditId)) {
+      return {
+        success: false,
+        alreadyRaised: true,
+        permanent: true,
+        error: 'A dispute has already been raised for this audit. Another dispute cannot be raised.'
+      };
+    }
+
+    const disputeId = 'DSP-' + Utilities.getUuid().replace(/-/g, '').substring(0, 12).toUpperCase();
+    const now = new Date();
+
+    updateObjectRow_(sheet, auditRow._rowNumber, {
+      'Dispute ID': disputeId,
+      'Dispute status': 'Open',
+      'Dispute Remarks': remarks,
+      'Dispute Raised At': now,
+      'Dispute Raised By': auditRow['Agent name'] || 'Agent',
+      'Dispute Raised By Email': currentEmail
+    });
+
+    logDashboardAction_(auditId, currentEmail, 'Dispute Raised', 'Dispute ID: ' + disputeId + ' | Remarks: ' + remarks);
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      disputeId: disputeId,
+      auditId: auditId,
+      status: 'Open',
+      message: 'Dispute raised successfully.'
+    };
+  } catch (error) {
+    console.error('raiseDispute:', error);
+    return {
+      success: false,
+      error: error && error.message ? error.message : 'Unable to raise dispute.'
+    };
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+/* =====================================================
+   ACCEPT FEEDBACK
+   ===================================================== */
+
+function acceptFeedback(feedbackData) {
+  const lock = LockService.getScriptLock();
+
+  try {
+    lock.waitLock(30000);
+
+    if (!feedbackData || typeof feedbackData !== 'object') {
+      return { success: false, error: 'Invalid feedback request.' };
+    }
+
+    const auditId = String(feedbackData.auditId || '').trim();
+    if (!auditId) return { success: false, error: 'Audit ID is required.' };
+
+    const currentEmail = getCurrentUserEmail_();
+    if (!currentEmail) {
+      return { success: false, error: 'Unable to identify your Google account.' };
+    }
+
+    const rawDump = ensureRawDumpActionColumns_();
+    const sheet = rawDump.sheet;
+    const auditRow = findRawDumpAudit_(auditId);
+
+    if (!auditRow) {
+      return { success: false, error: 'Audit record was not found in Raw_dump.' };
+    }
+
+    const auditAgentEmail = normalizeEmail_(auditRow['Agent email ID']);
+    if (auditAgentEmail && auditAgentEmail !== currentEmail) {
+      return {
+        success: false,
+        error: 'You are not authorized to accept feedback for this audit.'
+      };
+    }
+
+    const currentStatus = String(auditRow['Feedback Status'] || '').trim().toLowerCase();
+    if (currentStatus === 'accepted') {
+      return {
+        success: true,
+        alreadyAccepted: true,
+        auditId: auditId,
+        status: 'Accepted',
+        message: 'Feedback has already been accepted.'
+      };
+    }
+
+    const now = new Date();
+
+    updateObjectRow_(sheet, auditRow._rowNumber, {
+      'Feedback Status': 'Accepted',
+      'Feedback Accepted At': now,
+      'Feedback Accepted By': auditRow['Agent name'] || 'Agent',
+      'Feedback Accepted By Email': currentEmail
+    });
+
+    logDashboardAction_(auditId, currentEmail, 'Feedback Accepted', 'Agent accepted audit feedback.');
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      auditId: auditId,
+      status: 'Accepted',
+      acceptedAt: now.getTime(),
+      message: 'Feedback accepted successfully.'
+    };
+  } catch (error) {
+    console.error('acceptFeedback:', error);
+    return {
+      success: false,
+      error: error && error.message ? error.message : 'Unable to accept feedback.'
+    };
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+/* =====================================================
+   AUDIT ACTION STATUS
+   ===================================================== */
+
+function getAuditActionStatus(auditId) {
+  try {
+    const currentEmail = getCurrentUserEmail_();
+    if (!currentEmail) {
+      return { success: false, error: 'Unable to identify your Google account.' };
+    }
+
+    const row = findRawDumpAudit_(auditId);
+    if (!row) return { success: false, error: 'Audit record was not found.' };
+
+    const auditAgentEmail = normalizeEmail_(row['Agent email ID']);
+    if (auditAgentEmail && auditAgentEmail !== currentEmail) {
+      return { success: false, error: 'Unauthorized.' };
+    }
+
+    const disputeState = getRawDumpDisputeState_(row);
+    const feedbackStatus = String(row['Feedback Status'] || '').trim();
+
+    return {
+      success: true,
+      auditId: String(auditId || ''),
+      disputeRaised: disputeState.exists,
+      disputeId: disputeState.disputeId,
+      disputeStatus: disputeState.status,
+      disputeRemarks: disputeState.remarks,
+      feedbackStatus: feedbackStatus,
+      feedbackAccepted: feedbackStatus.toLowerCase() === 'accepted',
+      feedbackAcceptedAt: row['Feedback Accepted At'] || '',
+      feedbackAcceptedBy: row['Feedback Accepted By'] || ''
+    };
+  } catch (error) {
+    console.error('getAuditActionStatus:', error);
+    return {
+      success: false,
+      error: error && error.message ? error.message : 'Unable to retrieve audit action status.'
+    };
+  }
+}
+
+/* =====================================================
+   DISPUTE LIST
+   ===================================================== */
+
+function getDisputes() {
+  try {
+    const currentEmail = getCurrentUserEmail_();
+    if (!currentEmail) {
+      return { success: false, error: 'Unable to identify your Google account.' };
+    }
+
+    const sheet = ensureRawDumpActionColumns_().sheet;
+    const rows = getSheetObjects_(sheet);
+
+    const disputes = rows.filter(function(row) {
+      if (!String(row['Dispute ID'] || '').trim()) return false;
+      const agentEmail = normalizeEmail_(row['Agent email ID']);
+      return !agentEmail || agentEmail === currentEmail;
+    }).map(function(row) {
+      return {
+        'Dispute ID': row['Dispute ID'] || '',
+        'Audit ID': getAuditId_(row),
+        'Agent Name': row['Agent name'] || '',
+        'Agent Email ID': row['Agent email ID'] || '',
+        'Auditor Name': row['Auditor Name'] || '',
+        'LOB': row['LOB'] || '',
+        'RMN/CMN/Ticket ID': row['RMN/CMN/Ticket ID'] || '',
+        'Audit Date': row['Audit date'] || '',
+        'Audit Score': row['% Score'] || '',
+        'Dispute Remarks': row['Dispute Remarks'] || '',
+        'Dispute Status': row['Dispute status'] || row['Dispute Status'] || '',
+        'Timestamp': row['Dispute Raised At'] || '',
+        'Feedback Status': row['Feedback Status'] || ''
+      };
+    });
+
+    return { success: true, data: disputes };
+  } catch (error) {
+    console.error('getDisputes:', error);
+    return {
+      success: false,
+      error: error && error.message ? error.message : 'Unable to load disputes.'
+    };
+  }
+}
+
+/* =====================================================
+   AUDIT LOG
+   ===================================================== */
+
+function logDashboardAction_(auditId, email, action, details) {
+  try {
+    const sheet = getSpreadsheet_().getSheetByName(CONFIG.AUDIT_LOG_SHEET);
+    if (!sheet) return;
+
+    appendObjectRow_(sheet, {
+      'Timestamp': new Date(),
+      'Session ID': auditId,
+      'Agent Email': email,
+      'Action': action,
+      'Details': details
+    });
+  } catch (error) {
+    console.error('logDashboardAction_:', error);
+  }
+}
+
+/* =====================================================
+   GENERAL HELPERS
+   ===================================================== */
+
+function normalizeHeader_(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function normalizeRole_(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function normalizeEmail_(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function firstNonBlank_(values) {
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] !== null && typeof values[i] !== 'undefined' && String(values[i]).trim() !== '') {
+      return values[i];
+    }
+  }
+  return '';
+}
+
+function isBlankRow_(row) {
+  return row.every(function(value) {
+    return value === '' || value === null || typeof value === 'undefined';
+  });
+}
+
+function formatCellValue_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    if (isNaN(value.getTime())) return '';
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+  }
+  if (typeof value === 'number') return value;
+  return String(value == null ? '' : value);
+}
+
+function parseScore_(value) {
+  if (value === null || typeof value === 'undefined' || value === '') return null;
+
+  const original = String(value).trim();
+  let number = parseFloat(original.replace('%', ''));
+  if (isNaN(number)) return null;
+
+  if (number >= 0 && number <= 1 && original.indexOf('%') === -1) number *= 100;
+  return number;
+}
+
+function addUniqueValue_(object, value) {
+  const text = String(value || '').trim();
+  if (text) object[text] = true;
+}
+
+function roundNumber_(number, decimals) {
+  const multiplier = Math.pow(10, decimals);
+  return Math.round(number * multiplier) / multiplier;
+}
+
+/* =====================================================
+   TEST FUNCTIONS
+   ===================================================== */
+
+function testCurrentUser() {
+  const result = getCurrentUser_();
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function testDashboardData() {
+  const result = getDashboardData();
+
+  if (!result.success) {
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  console.log(JSON.stringify({
+    success: result.success,
+    user: result.user,
+    recordCount: result.data.length,
+    summary: result.summary
+  }, null, 2));
+
+  return result;
+}
+
+function setupRawDumpActions() {
+  try {
+    const result = ensureRawDumpActionColumns_();
+    result.sheet.getRange(1, 1, 1, result.sheet.getLastColumn()).setFontWeight('bold');
+    result.sheet.setFrozenRows(1);
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      message: 'Raw_dump dispute and feedback columns are ready.'
+    };
+  } catch (error) {
+    console.error('setupRawDumpActions:', error);
+    return {
+      success: false,
+      error: error && error.message ? error.message : 'Unable to prepare Raw_dump.'
+    };
+  }
+}
+
+function normalizeDateForFilter_(value) {
+
+  if (
+    value === null ||
+    typeof value === 'undefined' ||
+    value === ''
+  ) {
+    return '';
+  }
+
+  /*
+   * Google Sheets Date object.
+   */
+  if (
+    Object.prototype.toString.call(value) === '[object Date]'
+  ) {
+
+    if (isNaN(value.getTime())) {
+      return '';
+    }
+
+    return Utilities.formatDate(
+      value,
+      Session.getScriptTimeZone(),
+      'yyyy-MM-dd'
+    );
+  }
+
+  const text =
+    String(value)
+      .trim();
+
+  if (!text) {
+    return '';
+  }
+
+  /*
+   * Format:
+   * 3/16/2026
+   * 03/16/2026
+   */
+  let match =
+    text.match(
+      /^(\d{1,2})\/(\d{1,2})\/(\d{4})/
+    );
+
+  if (match) {
+
+    const month =
+      ('0' + match[1]).slice(-2);
+
+    const day =
+      ('0' + match[2]).slice(-2);
+
+    const year =
+      match[3];
+
+    return (
+      year +
+      '-' +
+      month +
+      '-' +
+      day
+    );
+  }
+
+  /*
+   * Format:
+   * 2026-03-16
+   * 2026-03-16 00:00:00
+   */
+  match =
+    text.match(
+      /^(\d{4})-(\d{1,2})-(\d{1,2})/
+    );
+
+  if (match) {
+
+    const year =
+      match[1];
+
+    const month =
+      ('0' + match[2]).slice(-2);
+
+    const day =
+      ('0' + match[3]).slice(-2);
+
+    return (
+      year +
+      '-' +
+      month +
+      '-' +
+      day
+    );
+  }
+
+  /*
+   * Last attempt:
+   * Let JavaScript parse the value.
+   */
+  const parsed =
+    new Date(text);
+
+  if (
+    !isNaN(parsed.getTime())
+  ) {
+
+    return Utilities.formatDate(
+      parsed,
+      Session.getScriptTimeZone(),
+      'yyyy-MM-dd'
+    );
+
+  }
+
+  return '';
+}
